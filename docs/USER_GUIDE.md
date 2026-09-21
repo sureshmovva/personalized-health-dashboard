@@ -7,21 +7,67 @@
 - Git
 
 ### Automated Setup & Launch
-```bash
-# Clone the repository
-git clone https://github.com/sureshmovva/personalized-health-dashboard.git
-cd personalized-health-dashboard
 
-# Run the automated setup and launch scripts
+#### Windows (Command Prompt / Explorer):
+Double-click or run from Command Prompt (`cmd`):
+```cmd
+setup.bat
+run.bat
+```
+
+#### Windows (PowerShell):
+If script execution is restricted on your machine, run:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\setup.ps1
+.\run.ps1
+```
+
+#### macOS / Linux:
+```bash
 ./setup.sh
 ./run.sh
 ```
 
-### Manual Command Launch
-```bash
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+### Manual Command Launch (Windows)
+
+#### Option A: Windows PowerShell
+```powershell
+# 1. Clone repository
+git clone https://github.com/sureshmovva/personalized-health-dashboard.git
+cd personalized-health-dashboard
+
+# 2. Create virtual environment
+python -m venv .venv
+
+# 3. Activate virtual environment
+.\.venv\Scripts\Activate.ps1
+
+# 4. Install dependencies
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+
+# 5. Launch Streamlit
+streamlit run app/main.py
+```
+
+#### Option B: Windows Command Prompt (CMD)
+```cmd
+REM 1. Clone repository
+git clone https://github.com/sureshmovva/personalized-health-dashboard.git
+cd personalized-health-dashboard
+
+REM 2. Create virtual environment
+python -m venv .venv
+
+REM 3. Activate virtual environment
+.venv\Scripts\activate.bat
+
+REM 4. Install dependencies
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+REM 5. Launch Streamlit
 streamlit run app/main.py
 ```
 Access the dashboard at `http://localhost:8501`.

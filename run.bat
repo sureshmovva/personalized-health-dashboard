@@ -10,6 +10,9 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
+REM Ensure project root is in PYTHONPATH
+set PYTHONPATH=%CD%;%PYTHONPATH%
+
 echo Starting Streamlit app on http://localhost:8501...
 streamlit run app/main.py
 

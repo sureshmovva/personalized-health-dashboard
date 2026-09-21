@@ -9,5 +9,6 @@ if (-not (Test-Path ".venv\Scripts\Activate.ps1")) {
 }
 
 & .\.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = (Get-Location).Path + ";$env:PYTHONPATH"
 Write-Host "Starting Streamlit dashboard on http://localhost:8501..." -ForegroundColor Green
 streamlit run app/main.py

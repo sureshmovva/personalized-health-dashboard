@@ -7,6 +7,14 @@ Unified health dashboard implementing:
 - End-to-end Traceability Links from charts/metrics back to Layer 1 original files
 """
 
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path regardless of execution directory or platform
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from datetime import datetime, timedelta, timezone
 import json
 import streamlit as st

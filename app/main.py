@@ -1,7 +1,9 @@
 """Streamlit Main Application Entry Point.
 
-Unified health dashboard that ingests, normalizes, deduplicates, and visualizes
-heterogeneous health metrics with persistent SQLite/DuckDB storage.
+Unified health dashboard implementing the Medallion Storage Architecture:
+- Bronze Layer: Immutable raw file storage with SHA-256 receipt tracking (data/bronze/)
+- Silver Layer: Schema-enforced, normalized, deduplicated relational store (data/health_store.db)
+- Gold Layer: High-performance clinical rollups (Time-in-Range, Glycemic CV%, 7-Day Weight Avg)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -17,16 +19,10 @@ from pipeline.models import (
 from pipeline.parsers.stelo_cgm import SteloCGMParser
 from pipeline.parsers.wyze_scale import WyzeScaleParser
 from pipeline.parsers.custom_csv import CustomCSVParser
-from pipeline.deduplicator import deduplicate_glucose, deduplicate_scale
-from pipeline.db import (
-    init_db,
-    save_glucose_readings,
-    save_scale_records,
-    get_all_glucose,
-    get_all_scale,
-    get_database_summary,
-    log_audit_event,
-)
+from pipeline.storage.bronze import BronzeStorage
+from pipeline.storage.silver import SilverStorage
+from pipeline.storage.gold import GoldAnalytics
+from pipeline.db import get_database_summary
 from app.components.metrics_cards import render_health_summary_cards
 from app.components.charts import render_glucose_chart, render_scale_chart
 
@@ -39,38 +35,54 @@ st.set_page_config(
 
 
 def init_session_state():
-    """Ensure persistent session state keys are instantiated and hydrate from DB."""
-    init_db()
+    """Ensure persistent session state keys are instantiated and hydrate from Silver layer."""
+    bronze = BronzeStorage()
+    silver = SilverStorage()
+    gold = GoldAnalytics(silver_storage=silver)
+
     if "dataset" not in st.session_state:
-        db_glucose = get_all_glucose()
-        db_scale = get_all_scale()
         st.session_state.dataset = UnifiedHealthDataset(
-            glucose_readings=db_glucose,
-            scale_records=db_scale,
+            glucose_readings=silver.get_clean_glucose(),
+            scale_records=silver.get_clean_scale(),
         )
     if "pipeline_logs" not in st.session_state:
         st.session_state.pipeline_logs = []
 
 
 def load_demo_data():
-    """Populate realistic sample data and persist to the secure database."""
+    """Generate synthetic data and flow through Bronze, Silver, and Gold tiers."""
     now = datetime.now(timezone.utc)
     base_glucose = 98.0
+    bronze = BronzeStorage()
+    silver = SilverStorage()
 
     # 48 hours of simulated 15-minute CGM readings
     sample_cgm: list[GlucoseReading] = []
+    cgm_raw_csv_lines = ["Timestamp,Glucose Value (mg/dL),Trend Arrow"]
     for i in range(192):
         ts = now - timedelta(minutes=(192 - i) * 15)
         hour = ts.hour
         val = base_glucose + (25 if 8 <= hour <= 10 or 12 <= hour <= 14 or 18 <= hour <= 20 else 0)
+        reading_val = round(val + (i % 7) * 2.5 - 5, 1)
+        trend = "Flat" if i % 4 != 0 else "FortyFiveUp"
+
         sample_cgm.append(
             GlucoseReading(
                 timestamp_utc=ts,
-                glucose_mg_dl=round(val + (i % 7) * 2.5 - 5, 1),
-                trend_arrow="Flat" if i % 4 != 0 else "FortyFiveUp",
+                glucose_mg_dl=reading_val,
+                trend_arrow=trend,
                 source=SourceType.STELO_CGM,
             )
         )
+        cgm_raw_csv_lines.append(f"{ts.isoformat()},{reading_val},{trend}")
+
+    # 1. Bronze: Store raw simulated payload
+    bronze.ingest_raw_file(
+        file_or_bytes="\n".join(cgm_raw_csv_lines).encode("utf-8"),
+        filename="stelo_cgm_baseline_demo.csv",
+        source=SourceType.STELO_CGM,
+        metadata={"note": "Baseline synthetic CGM data"},
+    )
 
     # 14 days of daily morning scale weigh-ins
     sample_scale: list[ScaleRecord] = []
@@ -89,38 +101,33 @@ def load_demo_data():
             )
         )
 
-    # Save directly to database
-    save_glucose_readings(sample_cgm)
-    save_scale_records(sample_scale)
-    log_audit_event(
-        source=SourceType.STELO_CGM,
-        raw_count=len(sample_cgm),
-        deduped_count=len(sample_cgm),
-        conflicts_resolved=0,
-        status="SUCCESS",
-        message="Generated and persisted synthetic baseline CGM dataset.",
-    )
+    # 2. Silver: Deduplicate & persist
+    silver.process_and_persist_glucose(sample_cgm, source=SourceType.STELO_CGM)
+    silver.process_and_persist_scale(sample_scale, source=SourceType.WYZE_SCALE)
 
-    st.session_state.dataset.glucose_readings = get_all_glucose()
-    st.session_state.dataset.scale_records = get_all_scale()
+    st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
+    st.session_state.dataset.scale_records = silver.get_clean_scale()
     st.session_state.pipeline_logs.append(
-        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Persisted demo dataset to database: {len(sample_cgm)} CGM points, {len(sample_scale)} scale weigh-ins."
+        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Medallion Pipeline Flow: Ingested to Bronze -> Enforced in Silver -> Generated Gold Analytics."
     )
 
 
 def main():
     init_session_state()
+    bronze = BronzeStorage()
+    silver = SilverStorage()
+    gold = GoldAnalytics(silver_storage=silver)
 
     st.title("🩺 Personalized Health Dashboard")
-    st.caption("Unified multi-source pipeline: Dexcom Stelo CGM, Wyze Scale Ultra & SQLite/DuckDB Persistence")
+    st.caption("Medallion Architecture: Bronze (Raw Blob) ──► Silver (Normalized) ──► Gold (Clinical Analytics)")
 
-    # --- Sidebar: Data Ingestion & Pipeline Controls ---
+    # --- Sidebar: Ingestion into Medallion Pipeline ---
     with st.sidebar:
         st.header("📥 Data Source Ingest")
 
         if st.button("🚀 Load Baseline Demo Data", use_container_width=True):
             load_demo_data()
-            st.success("Loaded & persisted demo dataset to local SQLite database!")
+            st.success("Loaded & persisted demo dataset across Bronze, Silver & Gold tiers!")
 
         st.divider()
 
@@ -130,25 +137,24 @@ def main():
             "Upload Dexcom/Stelo Export",
             type=["csv"],
             key="stelo_upload",
-            help="Upload raw Stelo Clarity or mobile CSV export.",
+            help="Raw CSV export is archived immutably in Bronze layer and parsed into Silver.",
         )
         if stelo_file:
             try:
-                parser = SteloCGMParser()
-                parsed_cgm = parser.parse(stelo_file)
-                before_count = len(parsed_cgm)
-                cleaned_cgm = deduplicate_glucose(parsed_cgm)
-                save_glucose_readings(cleaned_cgm)
-                log_audit_event(
+                # Bronze Layer: Store raw
+                stelo_bytes = stelo_file.getvalue()
+                bronze_receipt = bronze.ingest_raw_file(
+                    file_or_bytes=stelo_bytes,
+                    filename=stelo_file.name,
                     source=SourceType.STELO_CGM,
-                    raw_count=before_count,
-                    deduped_count=len(cleaned_cgm),
-                    conflicts_resolved=before_count - len(cleaned_cgm),
-                    status="SUCCESS",
-                    message="Ingested Stelo CGM CSV",
                 )
-                st.session_state.dataset.glucose_readings = get_all_glucose()
-                msg = f"Saved Stelo CGM: {before_count} raw rows -> {len(cleaned_cgm)} clean points persisted to database."
+
+                # Silver Layer: Parse, deduplicate, persist
+                parsed_cgm = SteloCGMParser().parse(stelo_file)
+                res = silver.process_and_persist_glucose(parsed_cgm, source=SourceType.STELO_CGM)
+                st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
+
+                msg = f"Bronze receipt {bronze_receipt['sha256'][:8]} -> Silver: {res['saved_count']} clean readings."
                 st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
                 st.sidebar.success(msg)
             except Exception as e:
@@ -160,25 +166,21 @@ def main():
             "Upload Wyze Scale Export",
             type=["csv"],
             key="wyze_upload",
-            help="Upload CSV export from Wyze Body Scale Ultra.",
+            help="Raw CSV export from Wyze Body Scale Ultra.",
         )
         if wyze_file:
             try:
-                parser = WyzeScaleParser()
-                parsed_scale = parser.parse(wyze_file)
-                before_scale = len(parsed_scale)
-                cleaned_scale = deduplicate_scale(parsed_scale)
-                save_scale_records(cleaned_scale)
-                log_audit_event(
+                wyze_bytes = wyze_file.getvalue()
+                bronze_receipt = bronze.ingest_raw_file(
+                    file_or_bytes=wyze_bytes,
+                    filename=wyze_file.name,
                     source=SourceType.WYZE_SCALE,
-                    raw_count=before_scale,
-                    deduped_count=len(cleaned_scale),
-                    conflicts_resolved=before_scale - len(cleaned_scale),
-                    status="SUCCESS",
-                    message="Ingested Wyze Scale CSV",
                 )
-                st.session_state.dataset.scale_records = get_all_scale()
-                msg = f"Saved Wyze Scale: {before_scale} raw weigh-ins -> {len(cleaned_scale)} clean records persisted to database."
+                parsed_scale = WyzeScaleParser().parse(wyze_file)
+                res = silver.process_and_persist_scale(parsed_scale, source=SourceType.WYZE_SCALE)
+                st.session_state.dataset.scale_records = silver.get_clean_scale()
+
+                msg = f"Bronze receipt {bronze_receipt['sha256'][:8]} -> Silver: {res['saved_count']} weigh-ins."
                 st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
                 st.sidebar.success(msg)
             except Exception as e:
@@ -193,17 +195,19 @@ def main():
         )
         if custom_file:
             try:
-                parser = CustomCSVParser()
-                res = parser.parse(custom_file)
+                bronze.ingest_raw_file(
+                    file_or_bytes=custom_file.getvalue(),
+                    filename=custom_file.name,
+                    source=SourceType.MANUAL_CSV,
+                )
+                res = CustomCSVParser().parse(custom_file)
                 if res["glucose"]:
-                    cleaned_manual_glucose = deduplicate_glucose(res["glucose"])
-                    save_glucose_readings(cleaned_manual_glucose)
-                    st.session_state.dataset.glucose_readings = get_all_glucose()
+                    silver.process_and_persist_glucose(res["glucose"], source=SourceType.MANUAL_CSV)
+                    st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
                 if res["scale"]:
-                    cleaned_manual_scale = deduplicate_scale(res["scale"])
-                    save_scale_records(cleaned_manual_scale)
-                    st.session_state.dataset.scale_records = get_all_scale()
-                st.sidebar.success("Merged and persisted custom tracking data into database.")
+                    silver.process_and_persist_scale(res["scale"], source=SourceType.MANUAL_CSV)
+                    st.session_state.dataset.scale_records = silver.get_clean_scale()
+                st.sidebar.success("Ingested manual CSV into Bronze and Silver layers.")
             except Exception as e:
                 st.sidebar.error(f"Error parsing Custom CSV: {e}")
 
@@ -229,77 +233,64 @@ def main():
 
     st.markdown("---")
 
-    # --- Interactive Visualizations & Database Explorer ---
-    chart_tab1, chart_tab2, chart_tab3, chart_tab4 = st.tabs([
+    # --- Interactive Visualizations & Medallion Explorer ---
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Continuous Glucose (CGM)",
         "⚖️ Weight & Body Composition",
-        "🗄️ Database Explorer (SQLite)",
-        "⚙️ Pipeline Deduplication & Logs",
+        "🏆 Gold Clinical Analytics",
+        "🏛️ Medallion Storage Inspector (Bronze / Silver)",
     ])
 
-    with chart_tab1:
+    with tab1:
         render_glucose_chart(glucose_data)
 
-    with chart_tab2:
+    with tab2:
         render_scale_chart(scale_data)
 
-    with chart_tab3:
-        st.subheader("Persistent SQLite Database Schema & Tables")
-        db_stats = get_database_summary()
-        col_db1, col_db2, col_db3, col_db4 = st.columns(4)
-        col_db1.metric("Database Storage", "data/health_store.db")
-        col_db2.metric("Stored Glucose Records", f"{db_stats['glucose_count']:,}")
-        col_db3.metric("Stored Scale Records", f"{db_stats['scale_count']:,}")
-        col_db4.metric("Audit Trail Events", f"{db_stats['audit_logs_count']:,}")
+    with tab3:
+        st.subheader("Gold Layer: Ambulatory Glucose Profile & Metabolic Rollups")
+        profile = gold.get_glycemic_profile(target_min=70.0, target_max=140.0)
+        weight_trend = gold.get_weight_trend()
 
-        st.markdown("#### Table: `glucose_readings`")
-        if glucose_data:
-            g_df = pd.DataFrame([
-                {
-                    "Timestamp (UTC)": r.timestamp_utc.isoformat(),
-                    "Glucose (mg/dL)": r.glucose_mg_dl,
-                    "Trend": r.trend_arrow,
-                    "Source": r.source.value,
-                }
-                for r in glucose_data[-50:]
-            ])
-            st.dataframe(g_df, use_container_width=True)
+        if profile.get("reading_count", 0) > 0:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Time-In-Range (70-140 mg/dL)", f"{profile['time_in_range_pct']}%", delta="Target: >70%")
+            c2.metric("Mean Glucose", f"{profile['mean_glucose_mg_dl']} mg/dL")
+            c3.metric("Glycemic Variability (CV%)", f"{profile['coefficient_of_variation_pct']}%", delta=profile["glycemic_status"])
+            c4.metric("Time Above Range (>140 mg/dL)", f"{profile['time_above_range_pct']}%")
+
+            st.markdown("#### Weight & Body Composition Trajectory")
+            w1, w2, w3 = st.columns(3)
+            w1.metric("Current Weight", f"{weight_trend.get('current_weight_lbs', '--')} lbs")
+            w2.metric("7-Day Moving Avg", f"{weight_trend.get('seven_day_avg_lbs', '--')} lbs")
+            w3.metric("Net Weight Delta", f"{weight_trend.get('total_weight_delta_lbs', '--')} lbs", delta=weight_trend.get("trend_direction"))
         else:
-            st.info("No records in `glucose_readings` table.")
+            st.info("No glucose or weight records in Silver layer to generate Gold analytics.")
 
-        st.markdown("#### Table: `scale_records`")
-        if scale_data:
-            s_df = pd.DataFrame([
-                {
-                    "Timestamp (UTC)": r.timestamp_utc.isoformat(),
-                    "Weight (lbs)": r.weight_lbs,
-                    "Weight (kg)": r.weight_kg,
-                    "Body Fat %": r.body_fat_pct,
-                    "Muscle Mass (kg)": r.muscle_mass_kg,
-                    "Metabolic Age": r.metabolic_age,
-                    "Source": r.source.value,
-                }
-                for r in scale_data[-50:]
-            ])
-            st.dataframe(s_df, use_container_width=True)
-        else:
-            st.info("No records in `scale_records` table.")
-
-    with chart_tab4:
-        st.subheader("Data Pipeline Deduplication & Audit Trail")
+    with tab4:
+        st.subheader("Medallion Multi-Tier Storage Inspector")
         st.markdown(
             """
-            **Conflict & Deduplication Rules:**
-            - **Glucose**: Sliding 2-minute time window; Stelo CGM overrides manual CSV.
-            - **Scale**: Sliding 15-minute time window; Wyze direct measurement overrides manual entries.
-            - **Clinical Records**: Physician lab panels (A1C, lipids) supersede OCR/wearable estimates.
+            - **Bronze Layer (`data/bronze/`)**: Cryptographically verified immutable raw blobs with SHA-256 receipts.
+            - **Silver Layer (`data/health_store.db`)**: Normalized Pydantic models with sliding-window deduplication.
+            - **Gold Layer**: Materialized analytical aggregates and clinical indices.
             """
         )
-        if st.session_state.pipeline_logs:
-            for log in reversed(st.session_state.pipeline_logs):
-                st.text(log)
+
+        st.markdown("#### Bronze Raw Ingestion Manifest")
+        raw_files = bronze.list_raw_files()
+        if raw_files:
+            b_df = pd.DataFrame(raw_files)[["file_id", "source", "original_filename", "sha256", "size_bytes", "ingested_at_utc"]]
+            st.dataframe(b_df, use_container_width=True)
         else:
-            st.info("No pipeline events recorded yet. Upload a file or load demo data.")
+            st.info("No raw files ingested into Bronze layer yet.")
+
+        st.markdown("#### Silver Deduplicated Records Summary")
+        db_stats = get_database_summary()
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Silver Database", "data/health_store.db")
+        col_s2.metric("Deduplicated Glucose", f"{db_stats['glucose_count']:,}")
+        col_s3.metric("Deduplicated Scale Logs", f"{db_stats['scale_count']:,}")
 
 
 if __name__ == "__main__":

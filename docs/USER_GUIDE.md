@@ -33,22 +33,26 @@ Open your browser at `http://localhost:8501`.
 
 ---
 
-## 2. Ingesting Your Health Data
+## 2. Ingesting Your Health Data (Medallion Pipeline)
 
 ### Dexcom / Stelo Continuous Glucose Monitor (CGM)
 1. In the Dexcom Clarity or Stelo mobile app, export your glucose log as a CSV.
 2. In the sidebar under **1. Stelo CGM CSV**, click **Browse files** and upload.
-3. The dashboard normalizes timestamps to UTC, executes sliding-window deduplication, saves to `data/health_store.db`, and plots the trajectory against clinical glycemic target zones (70–140 mg/dL).
+3. **What happens under the hood:**
+   - **Bronze**: Raw CSV is archived with a cryptographic SHA-256 hash in `data/bronze/stelo_cgm/`.
+   - **Silver**: Pydantic v2 normalizes timestamps to ISO 8601 UTC, deduplicates points within a 2-minute sliding window, and saves to `data/health_store.db`.
+   - **Gold**: Automatically updates your Time-in-Range (TIR) and Glycemic Variability (CV%).
 
 ### Wyze Body Scale Ultra
 1. In the Wyze app, go to **Scale > Data History > Export CSV**.
 2. In the sidebar under **2. Wyze Scale CSV**, upload the file.
-3. The pipeline standardizes weights across pounds and kilograms, computes body fat trends, and stores records in the `scale_records` table.
+3. Stored in Bronze and Silver tiers, updating your 7-day moving weight average and body fat trajectory in the Gold tier.
 
 ---
 
-## 3. Database Explorer
-Click on the **🗄️ Database Explorer (SQLite)** tab inside the dashboard to:
-- Review total records saved in `data/health_store.db`.
-- Inspect stored rows in `glucose_readings` and `scale_records`.
-- Review the audit log of all raw vs. deduplicated records and resolved conflicts.
+## 3. Medallion Storage Inspector
+Inside the Streamlit dashboard, switch between tabs:
+- **📈 Continuous Glucose (CGM)**: Visual trajectory with target glycemic zones (70–140 mg/dL).
+- **⚖️ Weight & Body Composition**: Scale history with lbs and kg tracking.
+- **🏆 Gold Clinical Analytics**: Time-In-Range percentage, Mean Glucose, CV% stability, and moving averages.
+- **🏛️ Medallion Storage Inspector**: Direct visibility into raw Bronze file receipts and Silver database counts.

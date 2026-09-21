@@ -1,71 +1,65 @@
 # Personalized Health Dashboard — Architecture Guide
 
-## 1. System Overview & The Medallion Storage Pattern
-When processing heterogeneous health data (unstructured clinical PDFs, lab reports, continuous 5-minute CGM streams, daily scale weigh-ins, and manual tracking spreadsheets), no single database format handles every requirement efficiently. 
+## 1. System Overview & The Multi-Layer Storage Architecture
+When building a health application that ingests unstructured files (PDFs, clinical notes) alongside structured continuous streams (CSVs, CGM feeds, scale metrics), no single database format handles everything efficiently.
 
-We implement the industry-standard **Medallion Multi-Tier Storage Architecture**:
-
-```
-+-----------------------------------------------------------------------------------------+
-|                                BRONZE LAYER (Raw Ingestion)                             |
-|  - Immutable archive of incoming payloads (raw PDFs, unmodified CSV exports, JSON)       |
-|  - Cryptographic SHA-256 fingerprinting & manifest cataloging in data/bronze/manifest.json |
-|  - Guarantees 100% auditability; allows reprocessing if parsing or OCR logic improves   |
-+--------------------------------------------+--------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                        SILVER LAYER (Extraction & Schema Enforcement)                   |
-|  - Pydantic v2 schema enforcement (UTC timestamps, unit conversions: lbs<->kg, mg/dL)   |
-|  - Sliding-window deduplication (2m CGM window, 15m scale window)                       |
-|  - Deterministic priority conflict resolution (Lab > Sensor > Aggregator > Manual)      |
-|  - Persisted in structured relational tables (data/health_store.db: SQLite / DuckDB)    |
-+--------------------------------------------+--------------------------------------------+
-                                             |
-                                             v
-+-----------------------------------------------------------------------------------------+
-|                          GOLD LAYER (Unified Query & Clinical Insights)                 |
-|  - Standardized Ambulatory Glucose Profile (AGP): Time-in-Range (70-140 mg/dL), TAR, TBR|
-|  - Glycemic variability analytics: Mean Glucose, Standard Deviation, and CV%            |
-|  - Body composition trends: 7-day moving averages and net mass deltas                   |
-|  - High-performance query interfaces for Streamlit frontend and clinical report exports |
-+-----------------------------------------------------------------------------------------+
-```
-
-## 2. Directory Layout & Storage Hierarchy
+We implement a multi-layer storage architecture with end-to-end traceability:
 
 ```
-data/
-├── bronze/                             # Raw immutable files
-│   ├── manifest.json                   # SHA-256 catalog and provenance receipt index
-│   ├── stelo_cgm/YYYY/MM/DD/           # Date-partitioned raw CGM CSVs
-│   ├── wyze_scale/YYYY/MM/DD/          # Date-partitioned raw scale CSVs
-│   └── teladoc_pdf/YYYY/MM/DD/         # Raw clinical PDFs & lab reports
-├── silver/                             # Structured relational data
-│   └── health_store.db                 # SQLite database (WAL mode, relational constraints)
-└── gold/                               # Materialized analytical rollups and cached aggregates
+Layer 1: Unstructured Raw Vault (Object Storage)
+  (PDFs, CSVs, Notes preserved immutably with SHA-256 hash in data/bronze/)
+                            |
+                            v
+Layer 2: Normalized Document Store (Unified JSON Records)
+  (Pydantic v2 / Unified JSON with (user_id, timestamp) composite indices in data/health_store.db)
+                            |
+                            v
+Layer 3: Denormalized Daily Rollups & Unified Query Layer
+  (Single-roundtrip dashboard fetch across glucose, weight, and steps without joins)
 ```
 
-## 3. Storage Layer Modules
+---
 
-### Bronze Storage (`pipeline/storage/bronze.py`)
-- Calculates SHA-256 hash upon ingestion.
-- Date-partitions payloads into `data/bronze/{source}/YYYY/MM/DD/`.
-- Appends receipt metadata (file ID, timestamp, byte size, origin) to `data/bronze/manifest.json`.
+## 2. Layer 1: Unstructured Raw Vault (Object Storage)
+- **Storage Format**: Local filesystem or S3-compatible Blob Storage (`data/bronze/{source}/YYYY/MM/DD/`).
+- **What to store**: Original PDF clinical records, raw CSV files, and unparsed text notes.
+- **Why**: Preserves the immutable source-of-truth. If parsing heuristics, OCR models, or AI extraction prompts improve, original files can be re-processed without data loss.
+- **Receipts**: Cryptographically verified SHA-256 checksums cataloged in `data/bronze/manifest.json`.
 
-### Silver Storage (`pipeline/storage/silver.py`)
-- Executes sliding-window deduplication:
-  - **Glucose**: 2-minute sliding window; hardware sensor overrides manual CSV.
-  - **Scale**: 15-minute sliding window; bioimpedance scale overrides manual weight.
-- Persists normalized Pydantic records into SQLite with `UNIQUE(timestamp_utc, source)` constraints.
+---
 
-### Gold Analytics (`pipeline/storage/gold.py`)
-- Ambulatory Glucose Profile (AGP) metrics:
-  - **Time-in-Range (TIR)**: `%` of readings between 70.0 and 140.0 mg/dL.
-  - **Glycemic Variability (CV%)**: `(std_dev / mean) * 100` (target `< 36%` for optimal stability).
-  - **7-day Moving Weight Average**: Smooths daily water weight fluctuations.
+## 3. Layer 2: Normalized Document Store (Unified JSON Records)
+- **Storage Format**: SQLite with JSON extension / PostgreSQL JSONB in table `unified_health_records`.
+- **What to store**: Extracted metrics and events standardized into a single, unified schema using ISO 8601 UTC timestamps.
+- **Standardized Unified JSON Schema**:
+```json
+{
+  "user_id": "usr_987654",
+  "timestamp": "2026-09-21T16:00:00Z",
+  "source_type": "cgm",
+  "source_name": "Stelo CGM",
+  "metric_category": "blood_glucose",
+  "data": {
+    "value": 105,
+    "unit": "mg/dL",
+    "trend_arrow": "flat"
+  },
+  "metadata": {
+    "raw_file_id": "stelo_cgm_a48f91.csv",
+    "confidence_score": 0.99
+  }
+}
+```
 
-## 4. Conflict Resolution Hierarchy
-1. **Source Precedence**: Direct hardware sensors (Stelo CGM, Wyze Scale) override third-party aggregators and manual logs.
-2. **Clinical Supremacy**: Physician lab reports (A1C, lipid panels) override wearable estimates.
-3. **Temporal Ordering**: Identical source priorities retain the most recently recorded measurement.
+---
+
+## 4. Key Retrieval Rules for Health Dashboards
+
+1. **Partition/Index by `(user_id, timestamp)`**: Every query on the dashboard filters by `user_id` and date ranges. We maintain composite B-Tree indices:
+   - `idx_unified_user_timestamp` on `(user_id, timestamp_utc)`
+   - `idx_unified_user_category_timestamp` on `(user_id, metric_category, timestamp_utc)`
+   - `idx_unified_raw_file_id` on `(raw_file_id)`
+
+2. **Denormalize for Dashboard Views**: Stored in `unified_daily_rollups`. When loading the dashboard, fetch pre-aggregated daily records so the UI doesn't have to join separate tables for weight, glucose, and steps.
+
+3. **Traceability Link**: Every metric embeds a `raw_file_id` in its `metadata` pointing directly back to the original raw file (PDF/CSV) in Layer 1. Users clicking on a chart metric can view the exact source file and doctor's note it came from.

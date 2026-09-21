@@ -1,12 +1,14 @@
 """Streamlit Main Application Entry Point.
 
-Unified health dashboard implementing the Medallion Storage Architecture:
-- Bronze Layer: Immutable raw file storage with SHA-256 receipt tracking (data/bronze/)
-- Silver Layer: Schema-enforced, normalized, deduplicated relational store (data/health_store.db)
-- Gold Layer: High-performance clinical rollups (Time-in-Range, Glycemic CV%, 7-Day Weight Avg)
+Unified health dashboard implementing:
+- Layer 1: Unstructured Raw Vault (Object storage with SHA-256 receipts)
+- Layer 2: Normalized Document Store (Unified JSON Records, composite (user_id, timestamp) indexing)
+- Denormalized Daily Aggregates for single-query dashboard loads
+- End-to-end Traceability Links from charts/metrics back to Layer 1 original files
 """
 
 from datetime import datetime, timedelta, timezone
+import json
 import streamlit as st
 import pandas as pd
 
@@ -16,15 +18,23 @@ from pipeline.models import (
     SourceType,
     UnifiedHealthDataset,
 )
+from pipeline.models_unified import UnifiedHealthRecord
 from pipeline.parsers.stelo_cgm import SteloCGMParser
 from pipeline.parsers.wyze_scale import WyzeScaleParser
 from pipeline.parsers.custom_csv import CustomCSVParser
 from pipeline.storage.bronze import BronzeStorage
 from pipeline.storage.silver import SilverStorage
 from pipeline.storage.gold import GoldAnalytics
-from pipeline.db import get_database_summary
+from pipeline.document_store import (
+    insert_unified_records,
+    query_unified_records,
+    get_denormalized_daily_summaries,
+    get_traceability_link,
+)
 from app.components.metrics_cards import render_health_summary_cards
 from app.components.charts import render_glucose_chart, render_scale_chart
+
+DEFAULT_USER_ID = "usr_987654"
 
 st.set_page_config(
     page_title="Personalized Health Dashboard",
@@ -38,7 +48,6 @@ def init_session_state():
     """Ensure persistent session state keys are instantiated and hydrate from Silver layer."""
     bronze = BronzeStorage()
     silver = SilverStorage()
-    gold = GoldAnalytics(silver_storage=silver)
 
     if "dataset" not in st.session_state:
         st.session_state.dataset = UnifiedHealthDataset(
@@ -47,18 +56,23 @@ def init_session_state():
         )
     if "pipeline_logs" not in st.session_state:
         st.session_state.pipeline_logs = []
+    if "current_user_id" not in st.session_state:
+        st.session_state.current_user_id = DEFAULT_USER_ID
 
 
 def load_demo_data():
-    """Generate synthetic data and flow through Bronze, Silver, and Gold tiers."""
+    """Generate synthetic data across Layer 1 Vault, Layer 2 Document Store, and Gold Tier."""
     now = datetime.now(timezone.utc)
     base_glucose = 98.0
     bronze = BronzeStorage()
     silver = SilverStorage()
+    user_id = st.session_state.current_user_id
 
-    # 48 hours of simulated 15-minute CGM readings
-    sample_cgm: list[GlucoseReading] = []
+    # 1. Ingest simulated raw files into Layer 1 Vault
     cgm_raw_csv_lines = ["Timestamp,Glucose Value (mg/dL),Trend Arrow"]
+    sample_cgm: list[GlucoseReading] = []
+    unified_records: list[UnifiedHealthRecord] = []
+
     for i in range(192):
         ts = now - timedelta(minutes=(192 - i) * 15)
         hour = ts.hour
@@ -76,15 +90,15 @@ def load_demo_data():
         )
         cgm_raw_csv_lines.append(f"{ts.isoformat()},{reading_val},{trend}")
 
-    # 1. Bronze: Store raw simulated payload
-    bronze.ingest_raw_file(
+    # Store in Layer 1
+    receipt_cgm = bronze.ingest_raw_file(
         file_or_bytes="\n".join(cgm_raw_csv_lines).encode("utf-8"),
-        filename="stelo_cgm_baseline_demo.csv",
+        filename="stelo_cgm_baseline_export.csv",
         source=SourceType.STELO_CGM,
-        metadata={"note": "Baseline synthetic CGM data"},
+        metadata={"user_id": user_id},
     )
 
-    # 14 days of daily morning scale weigh-ins
+    # 14 days of scale weigh-ins
     sample_scale: list[ScaleRecord] = []
     for day in range(14):
         ts = (now - timedelta(days=14 - day)).replace(hour=7, minute=15, second=0)
@@ -101,14 +115,68 @@ def load_demo_data():
             )
         )
 
-    # 2. Silver: Deduplicate & persist
+    receipt_scale = bronze.ingest_raw_file(
+        file_or_bytes=b"Date,Weight_lbs,BodyFat_pct\n2026-09-21,178.2,18.1\n",
+        filename="wyze_scale_history.csv",
+        source=SourceType.WYZE_SCALE,
+        metadata={"user_id": user_id},
+    )
+
+    # Layer 2: Convert to Unified JSON Records with Traceability Link
+    for r in sample_cgm:
+        unified_records.append(
+            UnifiedHealthRecord(
+                user_id=user_id,
+                timestamp=r.timestamp_utc,
+                source_type="cgm",
+                source_name="Stelo CGM",
+                metric_category="blood_glucose",
+                data={
+                    "value": r.glucose_mg_dl,
+                    "unit": "mg/dL",
+                    "trend_arrow": r.trend_arrow,
+                },
+                metadata={
+                    "raw_file_id": receipt_cgm["file_id"],
+                    "confidence_score": 0.99,
+                },
+            )
+        )
+
+    for s in sample_scale:
+        unified_records.append(
+            UnifiedHealthRecord(
+                user_id=user_id,
+                timestamp=s.timestamp_utc,
+                source_type="scale",
+                source_name="Wyze Scale Ultra",
+                metric_category="body_weight",
+                data={
+                    "value_lbs": s.weight_lbs,
+                    "value_kg": s.weight_kg,
+                    "body_fat_pct": s.body_fat_pct,
+                    "muscle_mass_kg": s.muscle_mass_kg,
+                    "metabolic_age": s.metabolic_age,
+                    "unit": "lbs",
+                },
+                metadata={
+                    "raw_file_id": receipt_scale["file_id"],
+                    "confidence_score": 1.0,
+                },
+            )
+        )
+
+    # Persist in Layer 2 Document Store (automatically updates daily denormalized rollups)
+    insert_unified_records(unified_records)
+
+    # Also persist to Silver table for legacy compatibility
     silver.process_and_persist_glucose(sample_cgm, source=SourceType.STELO_CGM)
     silver.process_and_persist_scale(sample_scale, source=SourceType.WYZE_SCALE)
 
     st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
     st.session_state.dataset.scale_records = silver.get_clean_scale()
     st.session_state.pipeline_logs.append(
-        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Medallion Pipeline Flow: Ingested to Bronze -> Enforced in Silver -> Generated Gold Analytics."
+        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Ingested {len(unified_records)} Unified JSON records to Layer 2 with Layer 1 Traceability links."
     )
 
 
@@ -117,104 +185,96 @@ def main():
     bronze = BronzeStorage()
     silver = SilverStorage()
     gold = GoldAnalytics(silver_storage=silver)
+    user_id = st.session_state.current_user_id
 
     st.title("🩺 Personalized Health Dashboard")
-    st.caption("Medallion Architecture: Bronze (Raw Blob) ──► Silver (Normalized) ──► Gold (Clinical Analytics)")
+    st.caption("Layer 1 (Raw Vault) ──► Layer 2 (Normalized JSON Document Store) ──► Layer 3 (Clinical Rollups)")
 
-    # --- Sidebar: Ingestion into Medallion Pipeline ---
+    # --- Sidebar: User Partition & Ingest ---
     with st.sidebar:
-        st.header("📥 Data Source Ingest")
+        st.header("👤 User Context & Ingest")
+        st.text_input("Active User ID (Partition Key)", value=user_id, key="current_user_id")
 
         if st.button("🚀 Load Baseline Demo Data", use_container_width=True):
             load_demo_data()
-            st.success("Loaded & persisted demo dataset across Bronze, Silver & Gold tiers!")
+            st.success("Loaded & persisted across Layer 1 Vault & Layer 2 Document Store!")
 
         st.divider()
 
-        # Source 1: Stelo CGM
+        # Ingest 1: Stelo CGM
         st.subheader("1. Stelo CGM CSV")
-        stelo_file = st.file_uploader(
-            "Upload Dexcom/Stelo Export",
-            type=["csv"],
-            key="stelo_upload",
-            help="Raw CSV export is archived immutably in Bronze layer and parsed into Silver.",
-        )
+        stelo_file = st.file_uploader("Upload Dexcom/Stelo Export", type=["csv"], key="stelo_upload")
         if stelo_file:
             try:
-                # Bronze Layer: Store raw
-                stelo_bytes = stelo_file.getvalue()
-                bronze_receipt = bronze.ingest_raw_file(
-                    file_or_bytes=stelo_bytes,
+                # Layer 1 Vault
+                receipt = bronze.ingest_raw_file(
+                    file_or_bytes=stelo_file.getvalue(),
                     filename=stelo_file.name,
                     source=SourceType.STELO_CGM,
+                    metadata={"user_id": user_id},
                 )
+                parsed = SteloCGMParser().parse(stelo_file)
+                silver.process_and_persist_glucose(parsed, source=SourceType.STELO_CGM)
 
-                # Silver Layer: Parse, deduplicate, persist
-                parsed_cgm = SteloCGMParser().parse(stelo_file)
-                res = silver.process_and_persist_glucose(parsed_cgm, source=SourceType.STELO_CGM)
+                # Layer 2 Unified Documents
+                doc_records = [
+                    UnifiedHealthRecord(
+                        user_id=user_id,
+                        timestamp=r.timestamp_utc,
+                        source_type="cgm",
+                        source_name="Stelo CGM",
+                        metric_category="blood_glucose",
+                        data={"value": r.glucose_mg_dl, "unit": "mg/dL", "trend_arrow": r.trend_arrow},
+                        metadata={"raw_file_id": receipt["file_id"], "confidence_score": 0.99},
+                    )
+                    for r in parsed
+                ]
+                insert_unified_records(doc_records)
                 st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
-
-                msg = f"Bronze receipt {bronze_receipt['sha256'][:8]} -> Silver: {res['saved_count']} clean readings."
-                st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
-                st.sidebar.success(msg)
+                st.sidebar.success(f"Archived in Layer 1 ({receipt['file_id']}) and saved {len(doc_records)} Unified JSON docs!")
             except Exception as e:
-                st.sidebar.error(f"Error parsing Stelo CSV: {e}")
+                st.sidebar.error(f"Error: {e}")
 
-        # Source 2: Wyze Scale
+        # Ingest 2: Wyze Scale
         st.subheader("2. Wyze Scale CSV")
-        wyze_file = st.file_uploader(
-            "Upload Wyze Scale Export",
-            type=["csv"],
-            key="wyze_upload",
-            help="Raw CSV export from Wyze Body Scale Ultra.",
-        )
+        wyze_file = st.file_uploader("Upload Wyze Scale Export", type=["csv"], key="wyze_upload")
         if wyze_file:
             try:
-                wyze_bytes = wyze_file.getvalue()
-                bronze_receipt = bronze.ingest_raw_file(
-                    file_or_bytes=wyze_bytes,
+                receipt = bronze.ingest_raw_file(
+                    file_or_bytes=wyze_file.getvalue(),
                     filename=wyze_file.name,
                     source=SourceType.WYZE_SCALE,
+                    metadata={"user_id": user_id},
                 )
                 parsed_scale = WyzeScaleParser().parse(wyze_file)
-                res = silver.process_and_persist_scale(parsed_scale, source=SourceType.WYZE_SCALE)
+                silver.process_and_persist_scale(parsed_scale, source=SourceType.WYZE_SCALE)
+
+                doc_records = [
+                    UnifiedHealthRecord(
+                        user_id=user_id,
+                        timestamp=s.timestamp_utc,
+                        source_type="scale",
+                        source_name="Wyze Scale Ultra",
+                        metric_category="body_weight",
+                        data={
+                            "value_lbs": s.weight_lbs,
+                            "value_kg": s.weight_kg,
+                            "body_fat_pct": s.body_fat_pct,
+                            "unit": "lbs",
+                        },
+                        metadata={"raw_file_id": receipt["file_id"], "confidence_score": 1.0},
+                    )
+                    for s in parsed_scale
+                ]
+                insert_unified_records(doc_records)
                 st.session_state.dataset.scale_records = silver.get_clean_scale()
-
-                msg = f"Bronze receipt {bronze_receipt['sha256'][:8]} -> Silver: {res['saved_count']} weigh-ins."
-                st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
-                st.sidebar.success(msg)
+                st.sidebar.success(f"Archived in Layer 1 ({receipt['file_id']}) and saved {len(doc_records)} Unified Scale docs!")
             except Exception as e:
-                st.sidebar.error(f"Error parsing Wyze CSV: {e}")
+                st.sidebar.error(f"Error: {e}")
 
-        # Source 3: Custom / Manual Tracker CSV
-        st.subheader("3. Manual CSV Tracker")
-        custom_file = st.file_uploader(
-            "Upload Manual Tracker Log",
-            type=["csv"],
-            key="custom_upload",
-        )
-        if custom_file:
-            try:
-                bronze.ingest_raw_file(
-                    file_or_bytes=custom_file.getvalue(),
-                    filename=custom_file.name,
-                    source=SourceType.MANUAL_CSV,
-                )
-                res = CustomCSVParser().parse(custom_file)
-                if res["glucose"]:
-                    silver.process_and_persist_glucose(res["glucose"], source=SourceType.MANUAL_CSV)
-                    st.session_state.dataset.glucose_readings = silver.get_clean_glucose()
-                if res["scale"]:
-                    silver.process_and_persist_scale(res["scale"], source=SourceType.MANUAL_CSV)
-                    st.session_state.dataset.scale_records = silver.get_clean_scale()
-                st.sidebar.success("Ingested manual CSV into Bronze and Silver layers.")
-            except Exception as e:
-                st.sidebar.error(f"Error parsing Custom CSV: {e}")
-
-    # --- Metrics Section ---
+    # --- Top Health Summary Cards ---
     glucose_data = st.session_state.dataset.glucose_readings
     scale_data = st.session_state.dataset.scale_records
-
     latest_glucose = glucose_data[-1] if glucose_data else None
     avg_24h = (
         sum(r.glucose_mg_dl for r in glucose_data[-96:]) / min(len(glucose_data), 96)
@@ -222,23 +282,22 @@ def main():
         else None
     )
     latest_scale = scale_data[-1] if scale_data else None
-    total_samples = len(glucose_data) + len(scale_data)
 
     render_health_summary_cards(
         latest_glucose=latest_glucose,
         glucose_avg_24h=avg_24h,
         latest_scale=latest_scale,
-        total_samples=total_samples,
+        total_samples=len(glucose_data) + len(scale_data),
     )
 
     st.markdown("---")
 
-    # --- Interactive Visualizations & Medallion Explorer ---
+    # --- Multi-Tab Experience ---
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Continuous Glucose (CGM)",
         "⚖️ Weight & Body Composition",
-        "🏆 Gold Clinical Analytics",
-        "🏛️ Medallion Storage Inspector (Bronze / Silver)",
+        "📄 Layer 2: Unified Document Store & Traceability",
+        "🏆 Denormalized Daily Dashboard Summaries",
     ])
 
     with tab1:
@@ -248,49 +307,67 @@ def main():
         render_scale_chart(scale_data)
 
     with tab3:
-        st.subheader("Gold Layer: Ambulatory Glucose Profile & Metabolic Rollups")
-        profile = gold.get_glycemic_profile(target_min=70.0, target_max=140.0)
-        weight_trend = gold.get_weight_trend()
-
-        if profile.get("reading_count", 0) > 0:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Time-In-Range (70-140 mg/dL)", f"{profile['time_in_range_pct']}%", delta="Target: >70%")
-            c2.metric("Mean Glucose", f"{profile['mean_glucose_mg_dl']} mg/dL")
-            c3.metric("Glycemic Variability (CV%)", f"{profile['coefficient_of_variation_pct']}%", delta=profile["glycemic_status"])
-            c4.metric("Time Above Range (>140 mg/dL)", f"{profile['time_above_range_pct']}%")
-
-            st.markdown("#### Weight & Body Composition Trajectory")
-            w1, w2, w3 = st.columns(3)
-            w1.metric("Current Weight", f"{weight_trend.get('current_weight_lbs', '--')} lbs")
-            w2.metric("7-Day Moving Avg", f"{weight_trend.get('seven_day_avg_lbs', '--')} lbs")
-            w3.metric("Net Weight Delta", f"{weight_trend.get('total_weight_delta_lbs', '--')} lbs", delta=weight_trend.get("trend_direction"))
-        else:
-            st.info("No glucose or weight records in Silver layer to generate Gold analytics.")
-
-    with tab4:
-        st.subheader("Medallion Multi-Tier Storage Inspector")
+        st.subheader("Normalized Document Store (Unified JSON Schema)")
         st.markdown(
-            """
-            - **Bronze Layer (`data/bronze/`)**: Cryptographically verified immutable raw blobs with SHA-256 receipts.
-            - **Silver Layer (`data/health_store.db`)**: Normalized Pydantic models with sliding-window deduplication.
-            - **Gold Layer**: Materialized analytical aggregates and clinical indices.
-            """
+            f"Filtered by indexed keys: `user_id = '{user_id}'` with composite `(user_id, timestamp_utc)` indexing."
         )
 
-        st.markdown("#### Bronze Raw Ingestion Manifest")
-        raw_files = bronze.list_raw_files()
-        if raw_files:
-            b_df = pd.DataFrame(raw_files)[["file_id", "source", "original_filename", "sha256", "size_bytes", "ingested_at_utc"]]
-            st.dataframe(b_df, use_container_width=True)
-        else:
-            st.info("No raw files ingested into Bronze layer yet.")
+        records = query_unified_records(user_id=user_id, limit=50)
+        if records:
+            # Display JSON sample
+            st.markdown("#### Sample Standardized JSON Record Layout")
+            st.json(records[-1].to_json_dict())
 
-        st.markdown("#### Silver Deduplicated Records Summary")
-        db_stats = get_database_summary()
-        col_s1, col_s2, col_s3 = st.columns(3)
-        col_s1.metric("Silver Database", "data/health_store.db")
-        col_s2.metric("Deduplicated Glucose", f"{db_stats['glucose_count']:,}")
-        col_s3.metric("Deduplicated Scale Logs", f"{db_stats['scale_count']:,}")
+            st.markdown("#### Indexed Document Records with Traceability Link")
+            df = pd.DataFrame([
+                {
+                    "timestamp": r.timestamp.isoformat(),
+                    "source_name": r.source_name,
+                    "metric_category": r.metric_category,
+                    "value": r.data.get("value") or r.data.get("value_lbs"),
+                    "unit": r.data.get("unit"),
+                    "raw_file_id (Layer 1 Link)": r.raw_file_id,
+                    "confidence_score": r.confidence_score,
+                }
+                for r in reversed(records)
+            ])
+            st.dataframe(df, use_container_width=True)
+
+            # Traceability Inspector
+            st.markdown("#### Layer 1 Traceability Provenance Lookup")
+            sample_file_id = records[-1].raw_file_id
+            if sample_file_id:
+                trace_receipt = get_traceability_link(sample_file_id)
+                if trace_receipt:
+                    st.success(f"Verified Traceability: Metric links directly to Layer 1 Raw Vault!")
+                    st.json(trace_receipt)
+        else:
+            st.info("No unified documents found for this user. Click 'Load Baseline Demo Data' in the sidebar.")
+
+    with tab4:
+        st.subheader("Denormalized Daily Health Summary (Single-Fetch Dashboard Table)")
+        st.markdown(
+            "Pre-aggregated records stored in `unified_daily_rollups`. The UI fetches daily glucose averages, TIR%, and scale metrics without running runtime joins across disparate tables."
+        )
+        daily_summaries = get_denormalized_daily_summaries(user_id=user_id)
+        if daily_summaries:
+            d_df = pd.DataFrame([
+                {
+                    "Date": d.date,
+                    "Mean Glucose (mg/dL)": d.glucose_mean_mg_dl,
+                    "TIR (70-140 mg/dL)": f"{d.glucose_time_in_range_pct}%" if d.glucose_time_in_range_pct else "--",
+                    "Min Glucose": d.glucose_min_mg_dl,
+                    "Max Glucose": d.glucose_max_mg_dl,
+                    "Readings Count": d.glucose_readings_count,
+                    "Weight (lbs)": d.weight_lbs,
+                    "Body Fat %": f"{d.body_fat_pct}%" if d.body_fat_pct else "--",
+                    "Layer 1 Source Files": ", ".join(d.traceability_raw_file_ids),
+                }
+                for d in daily_summaries
+            ])
+            st.dataframe(d_df, use_container_width=True)
+        else:
+            st.info("No daily summaries computed yet.")
 
 
 if __name__ == "__main__":

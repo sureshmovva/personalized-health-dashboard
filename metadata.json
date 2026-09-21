@@ -1,0 +1,6 @@
+{
+  "name": "Personalized Health Dashboard",
+  "description": "Unified health-tech data pipeline and Streamlit dashboard integrating Stelo CGM, Wyze Scale, Google/Apple Health, and medical records.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

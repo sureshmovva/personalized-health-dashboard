@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personalized-health-dashboard"
+version = "0.1.0"
+description = "Personalized health-tech data pipeline and Streamlit dashboard integrating CGM, scale, health exports, and lab reports."
+authors = [{ name = "Health Engineering Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.35.0",
+    "plotly>=5.22.0",
+    "pydantic>=2.7.0",
+    "pandas>=2.2.0",
+    "python-dateutil>=2.9.0",
+    "duckdb>=1.0.0",
+    "pypdf>=4.2.0",
+    "pdfplumber>=0.11.0",
+    "google-genai>=0.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --tb=short"
+testpaths = ["tests"]
+pythonpath = ["."]

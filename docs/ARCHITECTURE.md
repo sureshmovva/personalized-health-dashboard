@@ -30,10 +30,18 @@ The Personalized Health Dashboard is a Python-native data ingestion, normalizati
                                     |
                                     v
 +------------------------------------------------------------------------+
+|                 Backend Secure Database (pipeline/db.py)               |
+|  - Embedded zero-config SQLite / DuckDB at data/health_store.db        |
+|  - WAL mode, UTC timestamp indices, unique (time, source) constraints  |
+|  - Relational tables: glucose_readings, scale_records, audit_logs      |
++-----------------------------------+------------------------------------+
+                                    |
+                                    v
++------------------------------------------------------------------------+
 |                       Streamlit Frontend UI                            |
 |  - Live metric summary cards (Current Glucose, 24h Average, Scale)     |
 |  - Interactive Plotly visualizations (Target glycemic range bands)     |
-|  - Audit logging of conflict resolutions and data deduplication        |
+|  - Database Explorer tab for table inspection and audit trails         |
 +------------------------------------------------------------------------+
 ```
 
@@ -49,3 +57,13 @@ When records from multiple sources fall within the same temporal window:
 1. **Source Precedence**: Direct continuous biometric hardware sensors (Stelo CGM, Wyze Scale) override third-party aggregators and manual logs.
 2. **Clinical Supremacy**: Physician lab reports (e.g., A1C from Teladoc/PDF) override indirect estimates.
 3. **Temporal Ordering**: Identical source priorities retain the most recently recorded measurement.
+
+## 4. Backend Database Architecture (`pipeline/db.py`)
+- **Storage Engine**: Embedded SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and Foreign Key enforcement.
+- **Default Database Path**: `data/health_store.db`.
+- **Primary Relational Tables**:
+  - `glucose_readings`: Stored UTC timestamps with index `idx_glucose_timestamp`, `glucose_mg_dl`, `trend_arrow`, `source`, and unique constraint `uq_glucose_time_source`.
+  - `scale_records`: Stored UTC timestamps with index `idx_scale_timestamp`, `weight_kg`, `weight_lbs`, `body_fat_pct`, `muscle_mass_kg`, and unique constraint `uq_scale_time_source`.
+  - `activity_records`: Historical steps, heart rate, sleep duration, and active calories.
+  - `clinical_lab_records`: Standardized lab panels (A1C, cholesterol, triglycerides) and notes.
+  - `ingestion_audit_logs`: Transactional audit log recording every ingestion event, raw row count, deduplicated count, resolved conflicts, and status.

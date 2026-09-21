@@ -1,12 +1,10 @@
 """Streamlit Main Application Entry Point.
 
 Unified health dashboard that ingests, normalizes, deduplicates, and visualizes
-heterogeneous health metrics (Stelo CGM, Wyze Scale, Health Exports, and Manual CSVs).
+heterogeneous health metrics with persistent SQLite/DuckDB storage.
 """
 
-import os
 from datetime import datetime, timedelta, timezone
-from io import StringIO
 import streamlit as st
 import pandas as pd
 
@@ -20,6 +18,15 @@ from pipeline.parsers.stelo_cgm import SteloCGMParser
 from pipeline.parsers.wyze_scale import WyzeScaleParser
 from pipeline.parsers.custom_csv import CustomCSVParser
 from pipeline.deduplicator import deduplicate_glucose, deduplicate_scale
+from pipeline.db import (
+    init_db,
+    save_glucose_readings,
+    save_scale_records,
+    get_all_glucose,
+    get_all_scale,
+    get_database_summary,
+    log_audit_event,
+)
 from app.components.metrics_cards import render_health_summary_cards
 from app.components.charts import render_glucose_chart, render_scale_chart
 
@@ -32,15 +39,21 @@ st.set_page_config(
 
 
 def init_session_state():
-    """Ensure persistent session state keys are instantiated."""
+    """Ensure persistent session state keys are instantiated and hydrate from DB."""
+    init_db()
     if "dataset" not in st.session_state:
-        st.session_state.dataset = UnifiedHealthDataset()
+        db_glucose = get_all_glucose()
+        db_scale = get_all_scale()
+        st.session_state.dataset = UnifiedHealthDataset(
+            glucose_readings=db_glucose,
+            scale_records=db_scale,
+        )
     if "pipeline_logs" not in st.session_state:
         st.session_state.pipeline_logs = []
 
 
 def load_demo_data():
-    """Populate realistic sample data for instant demonstration and verification."""
+    """Populate realistic sample data and persist to the secure database."""
     now = datetime.now(timezone.utc)
     base_glucose = 98.0
 
@@ -48,7 +61,6 @@ def load_demo_data():
     sample_cgm: list[GlucoseReading] = []
     for i in range(192):
         ts = now - timedelta(minutes=(192 - i) * 15)
-        # diurnal curve simulation
         hour = ts.hour
         val = base_glucose + (25 if 8 <= hour <= 10 or 12 <= hour <= 14 or 18 <= hour <= 20 else 0)
         sample_cgm.append(
@@ -77,10 +89,22 @@ def load_demo_data():
             )
         )
 
-    st.session_state.dataset.glucose_readings = sample_cgm
-    st.session_state.dataset.scale_records = sample_scale
+    # Save directly to database
+    save_glucose_readings(sample_cgm)
+    save_scale_records(sample_scale)
+    log_audit_event(
+        source=SourceType.STELO_CGM,
+        raw_count=len(sample_cgm),
+        deduped_count=len(sample_cgm),
+        conflicts_resolved=0,
+        status="SUCCESS",
+        message="Generated and persisted synthetic baseline CGM dataset.",
+    )
+
+    st.session_state.dataset.glucose_readings = get_all_glucose()
+    st.session_state.dataset.scale_records = get_all_scale()
     st.session_state.pipeline_logs.append(
-        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Loaded synthetic baseline dataset: {len(sample_cgm)} CGM points, {len(sample_scale)} scale weigh-ins."
+        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Persisted demo dataset to database: {len(sample_cgm)} CGM points, {len(sample_scale)} scale weigh-ins."
     )
 
 
@@ -88,7 +112,7 @@ def main():
     init_session_state()
 
     st.title("🩺 Personalized Health Dashboard")
-    st.caption("Unified multi-source pipeline: Dexcom Stelo CGM, Wyze Scale Ultra & Clinical Records")
+    st.caption("Unified multi-source pipeline: Dexcom Stelo CGM, Wyze Scale Ultra & SQLite/DuckDB Persistence")
 
     # --- Sidebar: Data Ingestion & Pipeline Controls ---
     with st.sidebar:
@@ -96,7 +120,7 @@ def main():
 
         if st.button("🚀 Load Baseline Demo Data", use_container_width=True):
             load_demo_data()
-            st.success("Loaded demo dataset!")
+            st.success("Loaded & persisted demo dataset to local SQLite database!")
 
         st.divider()
 
@@ -114,8 +138,17 @@ def main():
                 parsed_cgm = parser.parse(stelo_file)
                 before_count = len(parsed_cgm)
                 cleaned_cgm = deduplicate_glucose(parsed_cgm)
-                st.session_state.dataset.glucose_readings = cleaned_cgm
-                msg = f"Parsed Stelo CGM: {before_count} rows -> {len(cleaned_cgm)} clean points after dedup."
+                save_glucose_readings(cleaned_cgm)
+                log_audit_event(
+                    source=SourceType.STELO_CGM,
+                    raw_count=before_count,
+                    deduped_count=len(cleaned_cgm),
+                    conflicts_resolved=before_count - len(cleaned_cgm),
+                    status="SUCCESS",
+                    message="Ingested Stelo CGM CSV",
+                )
+                st.session_state.dataset.glucose_readings = get_all_glucose()
+                msg = f"Saved Stelo CGM: {before_count} raw rows -> {len(cleaned_cgm)} clean points persisted to database."
                 st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
                 st.sidebar.success(msg)
             except Exception as e:
@@ -133,9 +166,19 @@ def main():
             try:
                 parser = WyzeScaleParser()
                 parsed_scale = parser.parse(wyze_file)
+                before_scale = len(parsed_scale)
                 cleaned_scale = deduplicate_scale(parsed_scale)
-                st.session_state.dataset.scale_records = cleaned_scale
-                msg = f"Parsed Wyze Scale: {len(parsed_scale)} rows -> {len(cleaned_scale)} clean weigh-ins."
+                save_scale_records(cleaned_scale)
+                log_audit_event(
+                    source=SourceType.WYZE_SCALE,
+                    raw_count=before_scale,
+                    deduped_count=len(cleaned_scale),
+                    conflicts_resolved=before_scale - len(cleaned_scale),
+                    status="SUCCESS",
+                    message="Ingested Wyze Scale CSV",
+                )
+                st.session_state.dataset.scale_records = get_all_scale()
+                msg = f"Saved Wyze Scale: {before_scale} raw weigh-ins -> {len(cleaned_scale)} clean records persisted to database."
                 st.session_state.pipeline_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
                 st.sidebar.success(msg)
             except Exception as e:
@@ -153,16 +196,14 @@ def main():
                 parser = CustomCSVParser()
                 res = parser.parse(custom_file)
                 if res["glucose"]:
-                    st.session_state.dataset.glucose_readings.extend(res["glucose"])
-                    st.session_state.dataset.glucose_readings = deduplicate_glucose(
-                        st.session_state.dataset.glucose_readings
-                    )
+                    cleaned_manual_glucose = deduplicate_glucose(res["glucose"])
+                    save_glucose_readings(cleaned_manual_glucose)
+                    st.session_state.dataset.glucose_readings = get_all_glucose()
                 if res["scale"]:
-                    st.session_state.dataset.scale_records.extend(res["scale"])
-                    st.session_state.dataset.scale_records = deduplicate_scale(
-                        st.session_state.dataset.scale_records
-                    )
-                st.sidebar.success("Merged custom tracking data into unified pipeline.")
+                    cleaned_manual_scale = deduplicate_scale(res["scale"])
+                    save_scale_records(cleaned_manual_scale)
+                    st.session_state.dataset.scale_records = get_all_scale()
+                st.sidebar.success("Merged and persisted custom tracking data into database.")
             except Exception as e:
                 st.sidebar.error(f"Error parsing Custom CSV: {e}")
 
@@ -188,10 +229,11 @@ def main():
 
     st.markdown("---")
 
-    # --- Interactive Visualizations ---
-    chart_tab1, chart_tab2, chart_tab3 = st.tabs([
+    # --- Interactive Visualizations & Database Explorer ---
+    chart_tab1, chart_tab2, chart_tab3, chart_tab4 = st.tabs([
         "📈 Continuous Glucose (CGM)",
         "⚖️ Weight & Body Composition",
+        "🗄️ Database Explorer (SQLite)",
         "⚙️ Pipeline Deduplication & Logs",
     ])
 
@@ -202,6 +244,48 @@ def main():
         render_scale_chart(scale_data)
 
     with chart_tab3:
+        st.subheader("Persistent SQLite Database Schema & Tables")
+        db_stats = get_database_summary()
+        col_db1, col_db2, col_db3, col_db4 = st.columns(4)
+        col_db1.metric("Database Storage", "data/health_store.db")
+        col_db2.metric("Stored Glucose Records", f"{db_stats['glucose_count']:,}")
+        col_db3.metric("Stored Scale Records", f"{db_stats['scale_count']:,}")
+        col_db4.metric("Audit Trail Events", f"{db_stats['audit_logs_count']:,}")
+
+        st.markdown("#### Table: `glucose_readings`")
+        if glucose_data:
+            g_df = pd.DataFrame([
+                {
+                    "Timestamp (UTC)": r.timestamp_utc.isoformat(),
+                    "Glucose (mg/dL)": r.glucose_mg_dl,
+                    "Trend": r.trend_arrow,
+                    "Source": r.source.value,
+                }
+                for r in glucose_data[-50:]
+            ])
+            st.dataframe(g_df, use_container_width=True)
+        else:
+            st.info("No records in `glucose_readings` table.")
+
+        st.markdown("#### Table: `scale_records`")
+        if scale_data:
+            s_df = pd.DataFrame([
+                {
+                    "Timestamp (UTC)": r.timestamp_utc.isoformat(),
+                    "Weight (lbs)": r.weight_lbs,
+                    "Weight (kg)": r.weight_kg,
+                    "Body Fat %": r.body_fat_pct,
+                    "Muscle Mass (kg)": r.muscle_mass_kg,
+                    "Metabolic Age": r.metabolic_age,
+                    "Source": r.source.value,
+                }
+                for r in scale_data[-50:]
+            ])
+            st.dataframe(s_df, use_container_width=True)
+        else:
+            st.info("No records in `scale_records` table.")
+
+    with chart_tab4:
         st.subheader("Data Pipeline Deduplication & Audit Trail")
         st.markdown(
             """
